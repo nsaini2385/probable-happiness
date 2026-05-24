@@ -1,305 +1,154 @@
 <#
 .SYNOPSIS
-    PSAppDeployToolkit v4 - Microsoft Office 365 x64 Deployment
-.DESCRIPTION
-    Installs, Uninstalls, or Repairs Microsoft Office 365 x64.
-    Converted from v3 Deploy-Application.ps1 to v4 format.
-    - Uses Show-ADTInstallationWelcome with DeferRunInterval to silently
-      absorb Intune re-check-ins within the defer window (fixes 10-min reprompt).
-    - No longer requires ServiceUI.exe; Invoke-AppDeployToolkit.exe handles
-      user session detection natively in v4.1+.
-.PARAMETER DeploymentType
-    Install | Uninstall | Repair  (default: Install)
-.PARAMETER DeployMode
-    Interactive | Silent | NonInteractive  (default: Interactive)
-.PARAMETER AllowRebootPassThru
-    Pass exit code 3010 back to the calling process.
-.PARAMETER TerminalServerMode
-    Enable user-install mode for RDS / Citrix hosts.
-.PARAMETER DisableLogging
-    Suppress log file output.
-.NOTES
-    Author  : kundv1 (v3 original) - converted to v4
-    Version : 4.0.0
-    Date    : 10/04/2024
-    PSADT   : 4.1.x required
+    Main orchestrator for Office 365 deployment.
+    Handles deferral prompt, progress window, install, and exit codes for Intune.
+    Run via ServiceUI.exe for Intune SYSTEM context, or directly as admin for testing.
 #>
+
 [CmdletBinding()]
-Param (
-    [Parameter(Mandatory = $false)]
-    [ValidateSet('Install', 'Uninstall', 'Repair')]
+param(
     [string]$DeploymentType = 'Install',
-
-    [Parameter(Mandatory = $false)]
-    [ValidateSet('Interactive', 'Silent', 'NonInteractive')]
-    [string]$DeployMode = 'Interactive',
-
-    [Parameter(Mandatory = $false)]
-    [switch]$AllowRebootPassThru,
-
-    [Parameter(Mandatory = $false)]
-    [switch]$TerminalServerMode,
-
-    [Parameter(Mandatory = $false)]
-    [switch]$DisableLogging
+    [string]$DeployMode     = 'Interactive'
 )
 
-
-##*=============================================
-##* IMPORT PSADT v4 MODULE
-##*=============================================
-try {
-    $adtModule = Join-Path -Path $PSScriptRoot -ChildPath 'PSAppDeployToolkit\PSAppDeployToolkit.psd1'
-    if (-not (Test-Path -LiteralPath $adtModule)) {
-        throw "PSAppDeployToolkit module not found at: $adtModule"
+# ============================================================
+# PSADT stub - allows script to run outside full PSADT context
+# ============================================================
+if (-not (Get-Command 'Write-ADTLogEntry' -ErrorAction SilentlyContinue)) {
+    function Write-ADTLogEntry {
+        param([string]$Message, [string]$Source)
+        $timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        Write-Host "[$timestamp][$Source] $Message"
+        $logDir = "C:\Windows\Logs\Software"
+        if (-not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory -Force | Out-Null }
+        "[$timestamp][$Source] $Message" | Out-File "$logDir\Office365_Install.log" -Append -Encoding UTF8
     }
-    Import-Module -Name $adtModule -Force
-
-    # Load custom scripts
-    . (Join-Path -Path $PSScriptRoot -ChildPath 'Show-DeferralPrompt.ps1')
-    . (Join-Path -Path $PSScriptRoot -ChildPath 'Show-ProgressWindow.ps1')
-}
-catch {
-    Write-Error "Failed to import PSAppDeployToolkit module: $_"
-    exit 60008
 }
 
+# ============================================================
+# Resolve script root correctly whether run via bat or directly
+# ============================================================
+$scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 
-##*=============================================
-##* INSTALL SCRIPTBLOCK
-##*=============================================
-$Install = {
+Write-ADTLogEntry -Message "=== Office 365 Deployment Started === DeploymentType: $DeploymentType | DeployMode: $DeployMode" -Source 'Invoke-AppDeployToolkit'
+Write-ADTLogEntry -Message "Script root: $scriptRoot" -Source 'Invoke-AppDeployToolkit'
 
-    ##*------------------------------------------
-    ##* PRE-INSTALLATION
-    ##*------------------------------------------
-    (Get-ADTSession).InstallPhase = 'Pre-Installation'
-
-    # Custom time-based deferral prompt
-    $deferResult = Show-DeferralPrompt `
-        -AppName      'Microsoft Office 365' `
-        -MaxDeferCount 4 `
-        -SnoozeDuration 60 `
-        -CloseApps    @('WINWORD','EXCEL','OUTLOOK','POWERPNT','ONENOTE','WINPROJ','VISIO','TEAMS','GROOVE')
-
-    # -1 = active defer window found, exit silently so Intune sees detection.ps1 return 0
-    if ($deferResult -eq -1) { Close-ADTSession; exit 0 }
-
-    ##*------------------------------------------
-    ##* INSTALLATION
-    ##*------------------------------------------
-    (Get-ADTSession).InstallPhase = 'Installation'
-
-    # Retrieve session object so DirFiles is available
-    $adtSession = Get-ADTSession
-
-    # Show custom progress window (no black box, no Software Center branding)
-    Show-ProgressWindow `
-        -StatusMessage 'Microsoft Office 365 Installation in Progress... This may take up to 25 minutes to complete.'
-
-    Write-ADTLogEntry -Message 'Starting Office removal and upgrade process...' -Source 'Install'
-
-    # Key paths
-    $SetupExe  = Join-Path -Path $adtSession.DirFiles -ChildPath 'setup.exe'
-    $dirFiles  = $adtSession.DirFiles
-    $PF86      = ${env:ProgramFiles(x86)}
-    $PF64      = $env:ProgramFiles
-    $MsiConfig = Join-Path -Path $dirFiles -ChildPath 'O2016\remove2016.xml'
-
-    # Helper: run ODT /configure with a named XML from Files\
-    # -WindowStyle Hidden suppresses the black console window from setup.exe
-    function Invoke-OfficeConfig {
-        param([string]$XmlName)
-        $XmlPath = Join-Path -Path $dirFiles -ChildPath $XmlName
-        if (Test-Path -Path $XmlPath) {
-            Write-ADTLogEntry -Message "Running ODT config: $XmlName" -Source 'Invoke-OfficeConfig'
-            Start-ADTProcess -FilePath $SetupExe -ArgumentList "/configure `"$XmlPath`"" -WindowStyle Hidden
-        }
-        else {
-            Write-ADTLogEntry -Message "XML not found, skipping: $XmlName" -Severity 2 -Source 'Invoke-OfficeConfig'
+# ============================================================
+# Clear stale DeferUntil so manual runs always show the prompt
+# ============================================================
+$AppKey  = 'Microsoft_Office365_x64_EN_003'
+$regPath = "HKLM:\SOFTWARE\PSADT_Deferrals\$AppKey"
+if (Test-Path $regPath) {
+    $existingDefer = (Get-ItemProperty -Path $regPath -Name 'DeferUntil' -ErrorAction SilentlyContinue).DeferUntil
+    if ($existingDefer) {
+        try {
+            $deferUntil = [DateTime]::Parse($existingDefer)
+            if ((Get-Date) -ge $deferUntil) {
+                Remove-ItemProperty -Path $regPath -Name 'DeferUntil' -ErrorAction SilentlyContinue
+                Write-ADTLogEntry -Message "Cleared expired DeferUntil: $existingDefer" -Source 'Invoke-AppDeployToolkit'
+            } else {
+                Write-ADTLogEntry -Message "Active DeferUntil found: $existingDefer - will be checked in deferral prompt" -Source 'Invoke-AppDeployToolkit'
+            }
+        } catch {
+            Remove-ItemProperty -Path $regPath -Name 'DeferUntil' -ErrorAction SilentlyContinue
         }
     }
+}
 
-    # 1. Remove Visio Standard - check both x86 and x64 C2R paths
-    if (Test-Path "$PF86\Microsoft Office\root\Office16\Visio.exe") {
-        Write-ADTLogEntry -Message 'Visio detected (x86) - removing...' -Source 'Install'
-        Invoke-OfficeConfig 'RemoveVisioStd.xml'
-    }
-    if (Test-Path "$PF64\Microsoft Office\root\Office16\Visio.exe") {
-        Write-ADTLogEntry -Message 'Visio detected (x64) - removing...' -Source 'Install'
-        Invoke-OfficeConfig 'RemoveVisioStd.xml'
-    }
+# ============================================================
+# Dot-source custom function scripts
+# ============================================================
+$deferralScript  = Join-Path $scriptRoot 'Show-DeferralPrompt.ps1'
+$progressScript  = Join-Path $scriptRoot 'Show-ProgressWindow.ps1'
 
-    # 2. Remove Project Standard - check both x86 and x64 C2R paths
-    if (Test-Path "$PF86\Microsoft Office\root\Office16\WinProj.exe") {
-        Write-ADTLogEntry -Message 'WinProj detected (x86) - removing...' -Source 'Install'
-        Invoke-OfficeConfig 'Uninstall-ProjStdXVolume.xml'
-    }
-    if (Test-Path "$PF64\Microsoft Office\root\Office16\WinProj.exe") {
-        Write-ADTLogEntry -Message 'WinProj detected (x64) - removing...' -Source 'Install'
-        Invoke-OfficeConfig 'Uninstall-ProjStdXVolume.xml'
-    }
+if (-not (Test-Path $deferralScript)) {
+    Write-ADTLogEntry -Message "ERROR: Show-DeferralPrompt.ps1 not found at $deferralScript" -Source 'Invoke-AppDeployToolkit'
+    exit 1
+}
+if (-not (Test-Path $progressScript)) {
+    Write-ADTLogEntry -Message "ERROR: Show-ProgressWindow.ps1 not found at $progressScript" -Source 'Invoke-AppDeployToolkit'
+    exit 1
+}
 
-    # 3. Remove legacy Office 2016 MSI - check both x86 and x64 Setup Controller paths
-    $MsiSetup86 = 'C:\Program Files (x86)\Common Files\Microsoft Shared\OFFICE16\Office Setup Controller\setup.exe'
-    $MsiSetup64 = 'C:\Program Files\Common Files\Microsoft Shared\OFFICE16\Office Setup Controller\setup.exe'
+. $deferralScript
+. $progressScript
 
-    if (Test-Path -Path $MsiSetup86) {
-        Write-ADTLogEntry -Message 'Legacy Office 2016 MSI detected (x86) - removing...' -Source 'Install'
-        Start-ADTProcess -FilePath $MsiSetup86 -ArgumentList "/uninstall PROPLUS /config `"$MsiConfig`"" -WindowStyle Hidden
-    }
-    if (Test-Path -Path $MsiSetup64) {
-        Write-ADTLogEntry -Message 'Legacy Office 2016 MSI detected (x64) - removing...' -Source 'Install'
-        Start-ADTProcess -FilePath $MsiSetup64 -ArgumentList "/uninstall PROPLUS /config `"$MsiConfig`"" -WindowStyle Hidden
-    }
+Write-ADTLogEntry -Message "Scripts loaded successfully" -Source 'Invoke-AppDeployToolkit'
 
-    # 4. Additional C2R cleanup passes (x86 C2R paths)
-    if (Test-Path "$PF86\Microsoft Office\root\Office16\winproj.exe") {
-        Invoke-OfficeConfig 'removeprj.xml'
-    }
-    if (Test-Path "$PF86\Microsoft Office\root\Office16\Visio.exe") {
-        Invoke-OfficeConfig 'RemoveVisioStd2021.xml'
-    }
-    if (Test-Path "$PF86\Microsoft Office\root\Office16\outlook.exe") {
-        Invoke-OfficeConfig 'remove.xml'
-    }
+# ============================================================
+# Show deferral prompt - user decides to install or defer
+# ============================================================
+Write-ADTLogEntry -Message "Launching deferral prompt..." -Source 'Invoke-AppDeployToolkit'
 
-    # 5. Deploy Office 365
-    Write-ADTLogEntry -Message 'Initiating Office 365 deployment...' -Source 'Install'
-    Invoke-OfficeConfig 'Configuration.xml'
+$deferResult = Show-DeferralPrompt
 
-    ##*------------------------------------------
-    ##* POST-INSTALLATION
-    ##*------------------------------------------
-    (Get-ADTSession).InstallPhase = 'Post-Installation'
+Write-ADTLogEntry -Message "Deferral prompt returned: $deferResult" -Source 'Invoke-AppDeployToolkit'
 
-    # Close the custom progress window
+if ($deferResult -eq -1) {
+    # User deferred - registry already written by Show-DeferralPrompt
+    # Detection script will return Exit 0 during deferral window
+    Write-ADTLogEntry -Message "User deferred. Exiting cleanly. Intune will retry when DeferUntil expires." -Source 'Invoke-AppDeployToolkit'
+    exit 0
+}
+
+# ============================================================
+# User clicked Install Now - proceed with installation
+# ============================================================
+Write-ADTLogEntry -Message "User accepted. Starting Office 365 installation..." -Source 'Invoke-AppDeployToolkit'
+
+# Show progress window in background
+Show-ProgressWindow
+
+# -------------------------------------------------------
+# YOUR OFFICE INSTALL COMMAND GOES HERE
+# Examples - uncomment/edit the one that matches your setup:
+# -------------------------------------------------------
+
+# Option A - setup.exe with XML config (most common for M365)
+$setupPath = Join-Path $scriptRoot 'setup.exe'
+$configPath = Join-Path $scriptRoot 'configuration.xml'
+
+if (Test-Path $setupPath) {
+    Write-ADTLogEntry -Message "Running: $setupPath /configure $configPath" -Source 'Invoke-AppDeployToolkit'
+    $installProcess = Start-Process -FilePath $setupPath `
+        -ArgumentList "/configure `"$configPath`"" `
+        -Wait -PassThru -NoNewWindow
+    $exitCode = $installProcess.ExitCode
+} else {
+    Write-ADTLogEntry -Message "ERROR: setup.exe not found at $setupPath" -Source 'Invoke-AppDeployToolkit'
     Close-ProgressWindow
+    exit 1
 }
 
+# Option B - MSI installer (uncomment if using MSI)
+# $msiPath = Join-Path $scriptRoot 'Office365.msi'
+# $installProcess = Start-Process -FilePath 'msiexec.exe' `
+#     -ArgumentList "/i `"$msiPath`" /qn /norestart" `
+#     -Wait -PassThru -NoNewWindow
+# $exitCode = $installProcess.ExitCode
 
-##*=============================================
-##* UNINSTALL SCRIPTBLOCK
-##*=============================================
-$Uninstall = {
+# -------------------------------------------------------
 
-    ##*------------------------------------------
-    ##* PRE-UNINSTALLATION
-    ##*------------------------------------------
-    (Get-ADTSession).InstallPhase = 'Pre-Uninstallation'
+Write-ADTLogEntry -Message "Install process exited with code: $exitCode" -Source 'Invoke-AppDeployToolkit'
 
-    $closeAppsAll = @(
-        'officeclicktorun', 'ose', 'osppsvc', 'sppsvc', 'msoia',
-        'excel', 'groove', 'onenote', 'infopath', 'outlook', 'mspub',
-        'powerpnt', 'winword', 'winproj', 'visio', 'iexplore',
-        'lync', 'communicator', 'teams', 'ONENOTEM', 'msaccess'
-    )
+# Close progress window
+Close-ProgressWindow
 
-    Show-ADTInstallationWelcome `
-        -CloseProcesses $closeAppsAll `
-        -AllowDefer `
-        -DeferTimes 3 `
-        -DeferRunInterval 60 `
-        -PersistPrompt
-
-    ##*------------------------------------------
-    ##* UNINSTALLATION
-    ##*------------------------------------------
-    (Get-ADTSession).InstallPhase = 'Uninstallation'
-
-    Show-ADTInstallationProgress `
-        -StatusMessage 'Uninstalling Microsoft Office 365. This may take some time. Please wait...'
-
-    Start-ADTProcess `
-        -FilePath      (Join-Path -Path (Get-ADTSession).DirFiles -ChildPath 'UnInstall.bat') `
-        -WindowStyle   Hidden
-
-    ##*------------------------------------------
-    ##* POST-UNINSTALLATION
-    ##*------------------------------------------
-    (Get-ADTSession).InstallPhase = 'Post-Uninstallation'
+# ============================================================
+# Clean up deferral registry on successful install
+# ============================================================
+if ($exitCode -eq 0 -or $exitCode -eq 3010) {
+    try {
+        Remove-Item -Path $regPath -Force -Recurse -ErrorAction SilentlyContinue
+        Write-ADTLogEntry -Message "Deferral registry cleaned up after successful install." -Source 'Invoke-AppDeployToolkit'
+    } catch {}
 }
 
-
-##*=============================================
-##* REPAIR SCRIPTBLOCK
-##*=============================================
-$Repair = {
-
-    ##*------------------------------------------
-    ##* PRE-REPAIR
-    ##*------------------------------------------
-    (Get-ADTSession).InstallPhase = 'Pre-Repair'
-
-    $closeAppsAll = @(
-        'officeclicktorun', 'ose', 'osppsvc', 'sppsvc', 'msoia',
-        'excel', 'groove', 'onenote', 'infopath', 'outlook', 'mspub',
-        'powerpnt', 'winword', 'winproj', 'visio', 'iexplore',
-        'lync', 'communicator', 'teams', 'ONENOTEM', 'msaccess'
-    )
-
-    Show-ADTInstallationWelcome `
-        -CloseProcesses $closeAppsAll `
-        -AllowDefer `
-        -DeferTimes 3 `
-        -DeferRunInterval 60 `
-        -PersistPrompt
-
-    ##*------------------------------------------
-    ##* REPAIR
-    ##*------------------------------------------
-    (Get-ADTSession).InstallPhase = 'Repair'
-
-    Show-ADTInstallationProgress `
-        -StatusMessage 'Repairing Microsoft Office 365. This may take some time. Please wait...'
-
-    Start-ADTProcess `
-        -FilePath      (Join-Path -Path (Get-ADTSession).DirFiles -ChildPath 'Install.bat') `
-        -WindowStyle   Hidden
-
-    ##*------------------------------------------
-    ##* POST-REPAIR
-    ##*------------------------------------------
-    (Get-ADTSession).InstallPhase = 'Post-Repair'
-}
-
-
-##*=============================================
-##* OPEN SESSION AND RUN
-##*=============================================
-try {
-    $sessionParams = @{
-        SessionState           = $ExecutionContext.SessionState
-        AppVendor              = 'Microsoft'
-        AppName                = 'Office 365'
-        AppVersion             = '365'
-        AppArch                = 'x64'
-        AppLang                = 'EN'
-        AppRevision            = '003'
-        AppScriptVersion       = '4.0.0'
-        AppScriptDate          = '10/04/2024'
-        AppScriptAuthor        = 'kundv1'
-        DeploymentType         = $DeploymentType
-        DeployMode             = $DeployMode
-        SuppressRebootPassThru = $AllowRebootPassThru
-        TerminalServerMode     = $TerminalServerMode
-        DisableLogging         = $DisableLogging
-    }
-
-    Open-ADTSession @sessionParams
-
-    switch ($DeploymentType) {
-        'Install'   { & $Install   }
-        'Uninstall' { & $Uninstall }
-        'Repair'    { & $Repair    }
-    }
-}
-catch {
-    Write-ADTLogEntry -Message "Unhandled error: $_" -Severity 3 -Source 'Invoke-AppDeployToolkit'
-    Show-ADTDialogBox -Title 'Installation Error' -Text $_.ToString() -Icon Stop -ErrorAction SilentlyContinue
-    Close-ProgressWindow
-    exit 60001
-}
-finally {
-    Close-ADTSession
-}
+# ============================================================
+# Exit with installer exit code for Intune
+# 0    = success
+# 3010 = success, reboot required
+# anything else = failure
+# ============================================================
+Write-ADTLogEntry -Message "=== Deployment Complete. Exit code: $exitCode ===" -Source 'Invoke-AppDeployToolkit'
+exit $exitCode

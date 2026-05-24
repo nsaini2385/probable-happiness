@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-    Custom WPF progress window - no title bar branding, no app info row.
-    Launched as a hidden background process to avoid black console popup.
-    Progress bar shows real percentage based on log scraping + time creep.
+    Custom WPF progress window with percentage tracking.
+    Launched as a hidden background process - no black console box.
+    Finds active user session explicitly for Intune SYSTEM context.
 #>
 
 function Show-ProgressWindow {
@@ -11,6 +11,12 @@ function Show-ProgressWindow {
     )
 
     $tempScript = "$env:TEMP\PSADT_Progress_$PID.ps1"
+
+    # Log active user session for diagnostics
+    $activeUser = (Get-Process -Name explorer -ErrorAction SilentlyContinue |
+                   Select-Object -First 1 |
+                   ForEach-Object { (Get-WmiObject Win32_Process -Filter "ProcessId=$($_.Id)").GetOwner().User })
+    Write-Host "Show-ProgressWindow: Launching for user session: $activeUser"
 
     $scriptContent = @"
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
@@ -58,10 +64,14 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
                         <ColumnDefinition Width="56"/>
                         <ColumnDefinition/>
                     </Grid.ColumnDefinitions>
-                    <Image Grid.Column="0"
-                           Source="$($PSScriptRoot -replace '\\','/')/Assets/AppIcon.png"
-                           Width="32" Height="32"
-                           HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    <Border Grid.Column="0" Width="36" Height="36"
+                            Background="#0078D4" CornerRadius="4"
+                            HorizontalAlignment="Center" VerticalAlignment="Center">
+                        <TextBlock Text="365" Foreground="White"
+                                   FontSize="11" FontWeight="Bold"
+                                   HorizontalAlignment="Center"
+                                   VerticalAlignment="Center"/>
+                    </Border>
                     <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="0,0,12,0">
                         <TextBlock Text="Microsoft Office 365"
                                    Foreground="White" FontSize="15" FontWeight="SemiBold"/>
@@ -144,14 +154,11 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 `$phaseText   = `$window.FindName('PhaseText')
 `$elapsedText = `$window.FindName('ElapsedText')
 
-`$startTime   = Get-Date
+`$startTime      = Get-Date
 `$script:lastPct = 0
 
-# Scrape Office setup log for real progress keywords
 function Get-OfficeInstallProgress {
     `$logFile = `$null
-
-    # Search both TEMP locations
     foreach (`$dir in @(`$env:TEMP, 'C:\Windows\Temp')) {
         `$found = Get-ChildItem -Path `$dir -Filter '*.log' -ErrorAction SilentlyContinue |
                   Where-Object { `$_.Name -match 'Office|M365|C2R|OfficeSetup|Setup' } |
@@ -159,9 +166,7 @@ function Get-OfficeInstallProgress {
                   Select-Object -First 1
         if (`$found) { `$logFile = `$found; break }
     }
-
     if (-not `$logFile) { return `$null }
-
     try {
         `$fs      = [System.IO.FileStream]::new(`$logFile.FullName,
                     [System.IO.FileMode]::Open,
@@ -182,7 +187,6 @@ function Get-OfficeInstallProgress {
         20 = @('initializing','validating','checking prerequisites','preparing')
         10 = @('starting','beginning','launched','started setup')
     }
-
     `$lower = `$content.ToLower()
     foreach (`$pct in `$stages.Keys) {
         foreach (`$keyword in `$stages[`$pct]) {
@@ -205,24 +209,19 @@ function Get-PhaseLabel {
     else                   { 'Completing installation...' }
 }
 
-# Draggable
 `$window.Add_MouseLeftButtonDown({ `$window.DragMove() })
 
-# Timer polls every 3 seconds
 `$timer          = [System.Windows.Threading.DispatcherTimer]::new()
 `$timer.Interval = [TimeSpan]::FromSeconds(3)
 
 `$timer.Add_Tick({
-    # Elapsed
     `$elapsed = (Get-Date) - `$startTime
     `$elapsedText.Text = 'Elapsed: ' + ('{0}:{1:00}' -f [int]`$elapsed.TotalMinutes, `$elapsed.Seconds)
 
-    # Log-based progress
     `$logPct = Get-OfficeInstallProgress
     if (`$logPct -and `$logPct -gt `$script:lastPct) {
         `$script:lastPct = `$logPct
     } else {
-        # Time-based creep — crawls to max 90% over 25 min so bar always moves
         `$timePct = [math]::Min(90, [int](`$elapsed.TotalMinutes / 25 * 90))
         if (`$timePct -gt `$script:lastPct) {
             `$script:lastPct = `$timePct
@@ -241,13 +240,13 @@ function Get-PhaseLabel {
 
     $scriptContent | Out-File -FilePath $tempScript -Encoding UTF8 -Force
 
+    # Launch hidden under the current user session - ServiceUI already bridged us here
     $script:ProgressProcess = Start-Process `
         -FilePath     'powershell.exe' `
         -ArgumentList "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$tempScript`"" `
         -WindowStyle  Hidden `
         -PassThru
 }
-
 
 function Close-ProgressWindow {
     if ($script:ProgressProcess -and -not $script:ProgressProcess.HasExited) {

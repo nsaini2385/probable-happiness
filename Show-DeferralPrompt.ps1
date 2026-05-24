@@ -1,18 +1,10 @@
-<#
-.SYNOPSIS
-    Live-polling deferral prompt with time picker.
-    User can pick a specific time today to install (within 3 hour window).
-    Closing X or SNOOZE re-shows after 60 min.
-    Topmost=False so other windows can come on top.
-    Registry DeferUntil keeps Intune from retrying during snooze.
-#>
 function Show-DeferralPrompt {
     param(
-        [string]$AppName      = 'Microsoft Office 365',
-        [int]$MaxDeferCount   = 4,
-        [int]$SnoozeDuration  = 60,
-        [int]$MaxDeferHours   = 4,    # max hours ahead user can schedule
-        [string[]]$CloseApps  = @('WINWORD','EXCEL','OUTLOOK','POWERPNT','ONENOTE','WINPROJ','VISIO','TEAMS','GROOVE')
+        [string]$AppName     = 'Microsoft Office 365',
+        [int]$MaxDeferCount  = 4,
+        [int]$SnoozeDuration = 60,
+        [int]$MaxDeferHours  = 4,
+        [string[]]$CloseApps = @('WINWORD','EXCEL','OUTLOOK','POWERPNT','ONENOTE','WINPROJ','VISIO','TEAMS','GROOVE')
     )
 
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
@@ -21,7 +13,6 @@ function Show-DeferralPrompt {
     $regPath   = "HKLM:\SOFTWARE\PSADT_Deferrals\$AppKey"
     $errorIcon = Join-Path -Path $PSScriptRoot -ChildPath 'Error.png'
 
-    # Check active defer window
     if (Test-Path $regPath) {
         $deferUntilStr = (Get-ItemProperty -Path $regPath -Name 'DeferUntil' -ErrorAction SilentlyContinue).DeferUntil
         if ($deferUntilStr) {
@@ -38,7 +29,30 @@ function Show-DeferralPrompt {
         }
     }
 
-    # Read defer count
+    $maxDeferWindowMins = 270
+
+    if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
+
+    $startTimeStr = (Get-ItemProperty -Path $regPath -Name 'ScriptStartTime' -ErrorAction SilentlyContinue).ScriptStartTime
+    if ($startTimeStr) {
+        try {
+            $previousStart = [DateTime]::Parse($startTimeStr)
+            $isStale  = $previousStart.Date -lt (Get-Date).Date
+            $isTooOld = $previousStart -lt (Get-Date).AddHours(-5)
+            if ($isStale -or $isTooOld) {
+                Write-ADTLogEntry -Message "Stale defer registry from $previousStart - clearing." -Source 'Show-DeferralPrompt'
+                Remove-Item -Path $regPath -Force -ErrorAction SilentlyContinue
+                New-Item -Path $regPath -Force | Out-Null
+                $startTimeStr = $null
+            }
+        } catch { $startTimeStr = $null }
+    }
+    if (-not $startTimeStr) {
+        $startTimeStr = (Get-Date).ToString('o')
+        Set-ItemProperty -Path $regPath -Name 'ScriptStartTime' -Value $startTimeStr -Force
+    }
+    $scriptStartTime = [DateTime]::Parse($startTimeStr)
+
     $deferCount = 0
     try {
         if (Test-Path $regPath) {
@@ -47,15 +61,18 @@ function Show-DeferralPrompt {
         }
     } catch {}
 
-    # Build time slot options - 30 min intervals up to MaxDeferHours from now
     function Get-TimeSlots {
-        $slots = [System.Collections.Generic.List[string]]::new()
-        $now   = Get-Date
-        # Round up to next 30 min mark
+        param([int]$DefersRemaining)
+        $slots     = [System.Collections.Generic.List[string]]::new()
+        $now       = Get-Date
+        $hardEnd   = $scriptStartTime.AddMinutes($maxDeferWindowMins)
+        $softHours = [math]::Min($DefersRemaining, $MaxDeferHours)
+        $softEnd   = $now.AddHours($softHours)
+        $windowEnd = if ($softEnd -lt $hardEnd) { $softEnd } else { $hardEnd }
+        if (($windowEnd - $now).TotalMinutes -lt 30) { return $slots }
         $start = $now.AddMinutes(30 - ($now.Minute % 30)).AddSeconds(-$now.Second)
-        $end   = $now.AddHours($MaxDeferHours)
         $cur   = $start
-        while ($cur -le $end) {
+        while ($cur -le $windowEnd) {
             $slots.Add($cur.ToString('h:mm tt'))
             $cur = $cur.AddMinutes(30)
         }
@@ -84,32 +101,34 @@ function Show-DeferralPrompt {
         return $found
     }
 
-    while ($true) {
+    $defersRemaining      = $MaxDeferCount - $deferCount
+    $snoozeVisibility     = if ($defersRemaining -gt 0) { 'Visible' } else { 'Collapsed' }
+    $timeSlots            = Get-TimeSlots -DefersRemaining $defersRemaining
+    $timePickerVisibility = if ($timeSlots.Count -gt 0 -and $defersRemaining -gt 0) { 'Visible' } else { 'Collapsed' }
 
-        $defersRemaining  = $MaxDeferCount - $deferCount
-        $snoozeVisibility = if ($defersRemaining -gt 0) { 'Visible' } else { 'Collapsed' }
+    $comboItems = ''
+    foreach ($slot in $timeSlots) {
+        $comboItems += "                    <ComboBoxItem Content=""$slot""/>`n"
+    }
 
-        if ($defersRemaining -le 0) {
-            Write-ADTLogEntry -Message "Max deferrals reached. Forcing installation." -Source 'Show-DeferralPrompt'
-            try { Remove-Item -Path $regPath -Force -ErrorAction SilentlyContinue } catch {}
-            return 0
-        }
+    $footerMsg = if ($defersRemaining -le 0) {
+        'All deferrals used. Please save your work and click Install Now.'
+    } elseif ($timeSlots.Count -eq 0) {
+        'No more time slots available. Please click Install Now to proceed.'
+    } else {
+        "You have $defersRemaining deferral(s) remaining."
+    }
 
-        # Build time slot items for ComboBox
-        $timeSlots    = Get-TimeSlots
-        $comboItems   = ''
-        foreach ($slot in $timeSlots) {
-            $comboItems += "                    <ComboBoxItem Content=""$slot""/>`n"
-        }
+    $slotCountMsg = "Each hour scheduled ahead uses 1 deferral - you have $defersRemaining left"
 
-        $xaml = @"
+    $xaml = @"
 <Window
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     Title="Software Installation"
     Width="520" SizeToContent="Height"
     WindowStartupLocation="CenterScreen"
-    Topmost="False"
+    Topmost="True"
     ResizeMode="NoResize"
     WindowStyle="None"
     Background="#FFFFFF"
@@ -148,19 +167,16 @@ function Show-DeferralPrompt {
                 <RowDefinition Height="50"/>
             </Grid.RowDefinitions>
 
-            <!-- Header -->
             <Rectangle Grid.Row="0" Fill="#1B3A6B"/>
             <TextBlock Grid.Row="0" Text="$AppName" Foreground="White"
                        FontSize="14" FontWeight="Bold"
                        VerticalAlignment="Center" Margin="16,0,0,0"/>
 
-            <!-- Body -->
             <StackPanel Grid.Row="1" Margin="18,12,18,10">
 
                 <TextBlock TextWrapping="Wrap" FontSize="12" Foreground="#1A1A1A" Margin="0,0,0,8"
                     Text="Microsoft Office (Outlook, Word, Excel, PowerPoint, etc.) is ready to be refreshed on your device. Please save your work before proceeding."/>
 
-                <!-- Running apps warning -->
                 <StackPanel Name="PanelRunning" Visibility="Collapsed" Margin="0,0,0,8">
                     <DockPanel>
                         <Image Name="ImgError" Source="$errorIcon" Width="28" Height="28"
@@ -175,27 +191,23 @@ function Show-DeferralPrompt {
                     </DockPanel>
                 </StackPanel>
 
-                <!-- Ready panel -->
                 <StackPanel Name="PanelReady" Visibility="Collapsed" Margin="0,0,0,8">
                     <TextBlock FontSize="12" FontWeight="Bold" Foreground="#107C10"
-                               Text="All applications are closed. Click OK to begin installation."/>
+                               Text="All applications are closed. Click Install Now to begin."/>
                 </StackPanel>
 
-                <!-- Divider -->
                 <Rectangle Height="1" Fill="#DDDDDD" Margin="0,2,0,8"/>
 
-                <!-- Defer info -->
                 <TextBlock FontSize="12" Foreground="#1A1A1A" Margin="0,0,0,2"
-                    Text="You can choose to defer the installation until the deferral expires:"/>
+                    Text="You can defer this installation to a more convenient time:"/>
                 <TextBlock FontSize="12" FontWeight="Bold" Foreground="#1A1A1A" Margin="0,0,0,6"
-                    Text="Remaining Deferrals: $defersRemaining"/>
+                    Text="Remaining Deferrals: $defersRemaining of $MaxDeferCount"/>
 
-                <!-- Schedule time picker -->
-                <StackPanel Visibility="$snoozeVisibility" Margin="0,0,0,4">
+                <StackPanel Visibility="$timePickerVisibility" Margin="0,0,0,4">
                     <TextBlock FontSize="12" Foreground="#1A1A1A" Margin="0,0,0,4"
-                        Text="Or schedule installation for a specific time today:"/>
+                        Text="Schedule installation for a specific time today:"/>
                     <DockPanel>
-                        <ComboBox Name="CmbTime" Width="130" Height="28"
+                        <ComboBox Name="CmbTime" Width="120" Height="28"
                                   FontSize="12" Margin="0,0,10,0"
                                   DockPanel.Dock="Left" SelectedIndex="0">
 $comboItems
@@ -203,16 +215,16 @@ $comboItems
                         <Button Name="BtnSchedule" Content="Schedule" Height="28" Width="90"
                                 DockPanel.Dock="Left"/>
                     </DockPanel>
-                    <TextBlock FontSize="10" Foreground="#888888" Margin="0,4,0,0"
-                        Text="Note: scheduled time must be within $MaxDeferHours hours (Intune timeout limit)."/>
+                    <TextBlock Name="TxtSlotCost" FontSize="10" Foreground="#CC6600"
+                               FontWeight="SemiBold" Margin="0,4,0,0"
+                               Text="$slotCountMsg"/>
                 </StackPanel>
 
-                <TextBlock FontSize="11" Foreground="#666666" Margin="0,6,0,0"
-                    Text="Once all deferrals are used, installation will proceed automatically."/>
+                <TextBlock FontSize="11" Foreground="#666666" Margin="0,8,0,0"
+                           TextWrapping="Wrap" Text="$footerMsg"/>
 
             </StackPanel>
 
-            <!-- Button bar -->
             <Border Grid.Row="2" Background="#F0F0F0" BorderBrush="#DDDDDD" BorderThickness="0,1,0,0">
                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Right"
                             VerticalAlignment="Center" Margin="0,0,16,0">
@@ -227,117 +239,130 @@ $comboItems
 </Window>
 "@
 
-        $reader        = [System.Xml.XmlReader]::Create([System.IO.StringReader]$xaml)
-        $window        = [System.Windows.Markup.XamlReader]::Load($reader)
-        $script:chosen = 'SNOOZE'
-        $script:scheduledMinutes = 0
+    $reader                    = [System.Xml.XmlReader]::Create([System.IO.StringReader]$xaml)
+    $window                    = [System.Windows.Markup.XamlReader]::Load($reader)
+    $script:chosen             = 'SNOOZE'
+    $script:scheduledMinutes   = 0
+    $script:deferralsToConsume = 1
 
-        $panelRunning = $window.FindName('PanelRunning')
-        $panelReady   = $window.FindName('PanelReady')
-        $txtRunning   = $window.FindName('TxtRunningApps')
-        $imgError     = $window.FindName('ImgError')
-        $cmbTime      = $window.FindName('CmbTime')
+    $panelRunning = $window.FindName('PanelRunning')
+    $panelReady   = $window.FindName('PanelReady')
+    $txtRunning   = $window.FindName('TxtRunningApps')
+    $imgError     = $window.FindName('ImgError')
+    $cmbTime      = $window.FindName('CmbTime')
+    $txtSlotCost  = $window.FindName('TxtSlotCost')
 
-        if (-not (Test-Path $errorIcon)) { $imgError.Visibility = 'Collapsed' }
+    if (-not (Test-Path $errorIcon)) { $imgError.Visibility = 'Collapsed' }
 
-        # Install Now
-        $window.FindName('BtnOK').Add_Click({
-            $script:chosen = 'OK'
-            $window.Close()
-        })
-
-        # Snooze 1hr
-        $window.FindName('BtnSnooze').Add_Click({
-            $script:chosen           = 'SNOOZE'
-            $script:scheduledMinutes = $SnoozeDuration
-            $window.Close()
-        })
-
-        # Schedule at specific time
-        $window.FindName('BtnSchedule').Add_Click({
-            $selected = $cmbTime.SelectedItem.Content
-            if ($selected) {
-                $targetTime = [DateTime]::Parse($selected)
-                # If time is earlier than now (e.g. user picks 9am and it's 10am) skip
-                if ($targetTime -lt (Get-Date)) {
-                    $targetTime = $targetTime.AddDays(1)
+    $cmbTime.Add_SelectionChanged({
+        $selected = $cmbTime.SelectedItem
+        if ($selected) {
+            try {
+                $targetTime = [DateTime]::Parse($selected.Content)
+                $mins       = [math]::Round(($targetTime - (Get-Date)).TotalMinutes)
+                $cost       = [math]::Ceiling($mins / 60)
+                $cost       = [math]::Max(1, [math]::Min($cost, $defersRemaining))
+                if ($cost -ge $defersRemaining) {
+                    $txtSlotCost.Text       = "This will use ALL $defersRemaining remaining deferral(s)"
+                    $txtSlotCost.Foreground = [System.Windows.Media.Brushes]::Red
+                } else {
+                    $txtSlotCost.Text       = "This will use $cost deferral(s) - $($defersRemaining - $cost) remaining after"
+                    $txtSlotCost.Foreground = [System.Windows.Media.Brushes]::DarkOrange
                 }
-                $minutesUntil = [math]::Round(($targetTime - (Get-Date)).TotalMinutes)
-                # Cap at Intune timeout safe limit
-                if ($minutesUntil -gt ($MaxDeferHours * 60)) {
-                    $minutesUntil = $MaxDeferHours * 60
-                }
-                $script:chosen           = 'SCHEDULE'
-                $script:scheduledMinutes = $minutesUntil
-                $window.Close()
-            }
+            } catch {}
+        }
+    })
+
+    $window.FindName('BtnOK').Add_Click({
+        $script:chosen = 'OK'
+        $window.Close()
+    })
+
+    $window.FindName('BtnSnooze').Add_Click({
+        $script:chosen             = 'SNOOZE'
+        $script:scheduledMinutes   = $SnoozeDuration
+        $script:deferralsToConsume = 1
+        $window.Close()
+    })
+
+    $window.FindName('BtnSchedule').Add_Click({
+        $selected = $cmbTime.SelectedItem.Content
+        if ($selected) {
+            $targetTime   = [DateTime]::Parse($selected)
+            if ($targetTime -lt (Get-Date)) { $targetTime = $targetTime.AddDays(1) }
+            $minutesUntil = [math]::Round(($targetTime - (Get-Date)).TotalMinutes)
+            $elapsed       = ((Get-Date) - $scriptStartTime).TotalMinutes
+            $remainingMins = $maxDeferWindowMins - $elapsed
+            if ($minutesUntil -gt $remainingMins) { $minutesUntil = [math]::Floor($remainingMins) }
+            $consumed = [math]::Ceiling($minutesUntil / 60)
+            $consumed = [math]::Max(1, [math]::Min($consumed, $defersRemaining))
+            $script:chosen             = 'SCHEDULE'
+            $script:scheduledMinutes   = $minutesUntil
+            $script:deferralsToConsume = $consumed
+            $window.Close()
+        }
+    })
+
+    $window.Add_MouseLeftButtonDown({ $window.DragMove() })
+
+    if ($defersRemaining -le 0) {
+        $window.Add_Closing({
+            param($s, $e)
+            if ($script:chosen -ne 'OK') { $e.Cancel = $true }
         })
+    }
 
-        # Draggable header
-        $window.Add_MouseLeftButtonDown({ $window.DragMove() })
-
-        # Live polling timer
-        $timer          = [System.Windows.Threading.DispatcherTimer]::new()
-        $timer.Interval = [TimeSpan]::FromSeconds(3)
-        $timer.Add_Tick({
-            $running = Get-RunningOfficeApps
-            if ($running.Count -gt 0) {
-                $txtRunning.Text         = $running -join "`n"
-                $panelRunning.Visibility = 'Visible'
-                $panelReady.Visibility   = 'Collapsed'
-            } else {
-                $panelRunning.Visibility = 'Collapsed'
-                $panelReady.Visibility   = 'Visible'
-            }
-        })
-        $timer.Start()
-
-        # Initial state
-        $init = Get-RunningOfficeApps
-        if ($init.Count -gt 0) {
-            $txtRunning.Text         = $init -join "`n"
+    $timer          = [System.Windows.Threading.DispatcherTimer]::new()
+    $timer.Interval = [TimeSpan]::FromSeconds(3)
+    $timer.Add_Tick({
+        $running = Get-RunningOfficeApps
+        if ($running.Count -gt 0) {
+            $txtRunning.Text         = $running -join "`n"
             $panelRunning.Visibility = 'Visible'
             $panelReady.Visibility   = 'Collapsed'
         } else {
             $panelRunning.Visibility = 'Collapsed'
             $panelReady.Visibility   = 'Visible'
         }
+    })
+    $timer.Start()
 
-        $window.ShowDialog() | Out-Null
-        $timer.Stop()
-
-        if ($script:chosen -eq 'OK') {
-            Write-ADTLogEntry -Message "User clicked Install Now." -Source 'Show-DeferralPrompt'
-            try { Remove-Item -Path $regPath -Force -ErrorAction SilentlyContinue } catch {}
-            return 0
-        }
-
-        # Work out how many minutes to sleep
-        $sleepMinutes = if ($script:chosen -eq 'SCHEDULE') {
-            Write-ADTLogEntry -Message "User scheduled install for $($cmbTime.SelectedItem.Content). Sleeping $($script:scheduledMinutes) min." -Source 'Show-DeferralPrompt'
-            $script:scheduledMinutes
-        } else {
-            Write-ADTLogEntry -Message "User snoozed 1hr. Deferral $($deferCount+1)/$MaxDeferCount." -Source 'Show-DeferralPrompt'
-            $SnoozeDuration
-        }
-
-        # Record defer
-        $deferCount++
-        $deferUntil = (Get-Date).AddMinutes($sleepMinutes).ToString('o')
-        if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
-        Set-ItemProperty -Path $regPath -Name 'DeferCount' -Value $deferCount -Force
-        Set-ItemProperty -Path $regPath -Name 'DeferUntil' -Value $deferUntil -Force
-
-        Write-ADTLogEntry -Message "DeferUntil: $deferUntil. Sleeping $sleepMinutes min..." -Source 'Show-DeferralPrompt'
-
-        $sleepSeconds = $sleepMinutes * 60
-        $slept = 0
-        while ($slept -lt $sleepSeconds) {
-            Start-Sleep -Seconds 30
-            $slept += 30
-        }
-
-        Remove-ItemProperty -Path $regPath -Name 'DeferUntil' -ErrorAction SilentlyContinue
-        Write-ADTLogEntry -Message "Sleep expired. Re-showing prompt." -Source 'Show-DeferralPrompt'
+    $init = Get-RunningOfficeApps
+    if ($init.Count -gt 0) {
+        $txtRunning.Text         = $init -join "`n"
+        $panelRunning.Visibility = 'Visible'
+        $panelReady.Visibility   = 'Collapsed'
+    } else {
+        $panelRunning.Visibility = 'Collapsed'
+        $panelReady.Visibility   = 'Visible'
     }
+
+    $window.ShowDialog() | Out-Null
+    $timer.Stop()
+
+    if ($script:chosen -eq 'OK') {
+        Write-ADTLogEntry -Message "User clicked Install Now." -Source 'Show-DeferralPrompt'
+        try { Remove-Item -Path $regPath -Force -ErrorAction SilentlyContinue } catch {}
+        return 0
+    }
+
+    $sleepMinutes = if ($script:chosen -eq 'SCHEDULE') {
+        Write-ADTLogEntry -Message "User scheduled for $($cmbTime.SelectedItem.Content). Consuming $($script:deferralsToConsume) deferral(s)." -Source 'Show-DeferralPrompt'
+        $script:scheduledMinutes
+    } else {
+        Write-ADTLogEntry -Message "User snoozed 1hr. Consuming 1 deferral. ($($deferCount+1)/$MaxDeferCount)" -Source 'Show-DeferralPrompt'
+        $SnoozeDuration
+    }
+
+    $deferCount += $script:deferralsToConsume
+    if ($deferCount -gt $MaxDeferCount) { $deferCount = $MaxDeferCount }
+
+    $deferUntil = (Get-Date).AddMinutes($sleepMinutes).ToString('o')
+    if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
+    Set-ItemProperty -Path $regPath -Name 'DeferCount' -Value $deferCount -Force
+    Set-ItemProperty -Path $regPath -Name 'DeferUntil' -Value $deferUntil -Force
+
+    Write-ADTLogEntry -Message "DeferUntil: $deferUntil. DeferCount: $deferCount/$MaxDeferCount. Exiting." -Source 'Show-DeferralPrompt'
+
+    return -1
 }
