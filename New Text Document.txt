@@ -1,6 +1,0 @@
-powershell.exe -ExecutionPolicy Bypass -File "C:\temp\Office365_v4\Invoke-AppDeployToolkit.ps1" -DeploymentType Install -DeployMode Interactive
-
-
-Invoke-AppDeployToolkit.exe -DeploymentType Install -DeployMode Interactive
-
-Invoke-AppDeployToolkit.exe -DeploymentType Uninstall -DeployMode Interactive
